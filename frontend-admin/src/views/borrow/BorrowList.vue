@@ -207,31 +207,33 @@
             </div>
           </template>
           <template v-else-if="column.key === 'status'">
-            <a-tag :color="getStatusColor(record.status)" :class="['status-tag', record.status]">
-              {{ getStatusText(record.status) }}
+            <a-tag :color="getStatusColor(getBorrowStatus(record))" :class="['status-tag', getBorrowStatus(record)]">
+              {{ getStatusText(getBorrowStatus(record)) }}
             </a-tag>
           </template>
           <template v-else-if="column.key === 'action'">
             <a-space>
               <a-button
-                v-if="record.status === 'borrowed' || record.status === 'overdue'"
+                v-if="getBorrowStatus(record) !== 'returned'"
                 type="link"
                 size="small"
                 class="table-action-btn return-btn"
+                :loading="returningId === record.id"
                 @click="handleReturn(record)"
               >
                 <CheckOutlined /> 归还
               </a-button>
               <a-button
-                v-if="record.status === 'borrowed' && record.renewCount < 2"
+                v-if="getBorrowStatus(record) === 'borrowed' && record.renewCount < 2"
                 type="link"
                 size="small"
                 class="table-action-btn renew-btn"
+                :disabled="renewingId === record.id"
                 @click="handleRenew(record)"
               >
                 <ReloadOutlined /> 续借
               </a-button>
-              <span v-if="record.status === 'returned'" class="completed-text">
+              <span v-if="getBorrowStatus(record) === 'returned'" class="completed-text">
                 <CheckCircleOutlined /> 已完成
               </span>
             </a-space>
@@ -317,6 +319,7 @@ import {
 import { useBorrowStore } from '@/stores/borrow'
 import { useReaderStore } from '@/stores/reader'
 import { useBookStore } from '@/stores/book'
+import { getReaderStatus, getBorrowStatus, todayStr } from '@/utils/library'
 
 const borrowStore = useBorrowStore()
 const readerStore = useReaderStore()
@@ -328,6 +331,8 @@ const selectedStatus = ref(null)
 const dateRange = ref(null)
 const borrowModalVisible = ref(false)
 const submitLoading = ref(false)
+const returningId = ref(null)
+const renewingId = ref(null)
 const borrowFormRef = ref(null)
 const isSearching = ref(false)
 const tableAnimating = ref(false)
@@ -371,7 +376,7 @@ const filteredRecords = computed(() => {
   }
 
   if (selectedStatus.value) {
-    result = result.filter(record => record.status === selectedStatus.value)
+    result = result.filter(record => getBorrowStatus(record) === selectedStatus.value)
   }
 
   if (dateRange.value && dateRange.value.length === 2) {
@@ -386,19 +391,19 @@ const filteredRecords = computed(() => {
 })
 
 const filteredTotalBorrowed = computed(() => {
-  return filteredRecords.value.filter(r => r.status === 'borrowed').length
+  return filteredRecords.value.filter(r => getBorrowStatus(r) === 'borrowed').length
 })
 
 const filteredTotalOverdue = computed(() => {
-  return filteredRecords.value.filter(r => r.status === 'overdue').length
+  return filteredRecords.value.filter(r => getBorrowStatus(r) === 'overdue').length
 })
 
 const returnedCount = computed(() => {
-  return filteredRecords.value.filter(r => r.status === 'returned').length
+  return filteredRecords.value.filter(r => getBorrowStatus(r) === 'returned').length
 })
 
 const todayBorrowCount = computed(() => {
-  const today = new Date().toISOString().split('T')[0]
+  const today = todayStr()
   return filteredRecords.value.filter(r => r.borrowDate === today).length
 })
 
@@ -415,9 +420,12 @@ const returnedPercent = computed(() => {
 })
 
 const availableReaders = computed(() => {
-  return readerStore.readers.filter(r =>
-    r.status === 'active' && r.borrowCount < r.maxBorrow
-  )
+  // 借阅入口与档案共用同一有效期判定规则，并以实际未归还记录数为准
+  return readerStore.readers.filter(r => {
+    if (getReaderStatus(r.expireDate) !== 'active') return false
+    const activeCount = borrowStore.getActiveBorrowCount(r.id)
+    return activeCount < r.maxBorrow
+  })
 })
 
 const availableBooks = computed(() => {
@@ -511,6 +519,8 @@ function showBorrowModal() {
 }
 
 async function handleBorrowSubmit() {
+  // 防止重复提交：保存进行中再次点击直接忽略
+  if (submitLoading.value) return
   try {
     await borrowFormRef.value.validate()
     submitLoading.value = true
@@ -520,6 +530,34 @@ async function handleBorrowSubmit() {
 
     if (!reader || !book) {
       message.error('读者或图书信息不存在')
+      return
+    }
+
+    // 与读者新增/编辑共用的卡号（读者）唯一与有效期规则
+    if (getReaderStatus(reader.expireDate) !== 'active') {
+      message.error(`读者 ${reader.name} 的读者证已过期，无法借阅`)
+      return
+    }
+    if (readerStore.hasDuplicateCardNo(reader.cardNo, reader.id)) {
+      message.error(`卡号 ${reader.cardNo} 存在重复档案，请先处理后再借阅`)
+      return
+    }
+    if (borrowStore.getActiveBorrowCount(reader.id) >= reader.maxBorrow) {
+      message.error('该读者已达到最大借阅数量，无法继续借阅')
+      return
+    }
+    if (book.available <= 0) {
+      message.error(`《${book.title}》库存不足，无法借阅`)
+      return
+    }
+    // 同一读者对同一图书存在未归还记录时不允许重复借阅
+    const duplicateBorrow = borrowStore.records.some(record =>
+      record.readerId === reader.id &&
+      record.bookId === book.id &&
+      getBorrowStatus(record) !== 'returned'
+    )
+    if (duplicateBorrow) {
+      message.error(`读者 ${reader.name} 已借阅《${book.title}》且尚未归还`)
       return
     }
 
@@ -547,7 +585,15 @@ async function handleBorrowSubmit() {
 }
 
 function handleReturn(record) {
-  borrowStore.returnBook(record.id)
+  // 防止重复归还导致库存增加、借阅数回退
+  if (returningId.value || getBorrowStatus(record) === 'returned') return
+  returningId.value = record.id
+
+  const success = borrowStore.returnBook(record.id)
+  if (!success) {
+    returningId.value = null
+    return
+  }
 
   const book = bookStore.getBookById(record.bookId)
   const reader = readerStore.getReaderById(record.readerId)
@@ -559,15 +605,19 @@ function handleReturn(record) {
     readerStore.updateReader(reader.id, { borrowCount: Math.max(0, reader.borrowCount - 1) })
   }
 
+  returningId.value = null
   message.success('归还成功')
 }
 
 function handleRenew(record) {
+  if (renewingId.value) return
+  renewingId.value = record.id
   const success = borrowStore.renewBook(record.id)
+  renewingId.value = null
   if (success) {
     message.success('续借成功，借阅期限延长15天')
   } else {
-    message.error('续借失败，已达到最大续借次数')
+    message.error('续借失败，已达到最大续借次数或记录已归还')
   }
 }
 </script>

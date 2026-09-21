@@ -91,8 +91,8 @@
                   </div>
                   <div class="borrow-meta">
                     <span class="borrow-date">{{ record.borrowDate }}</span>
-                    <a-tag :color="getStatusColor(record.status)" size="small" class="status-tag">
-                      {{ getStatusText(record.status) }}
+                    <a-tag :color="getStatusColor(getBorrowStatus(record))" size="small" class="status-tag">
+                      {{ getStatusText(getBorrowStatus(record)) }}
                     </a-tag>
                   </div>
                 </div>
@@ -196,6 +196,7 @@ import { useBookStore } from '@/stores/book'
 import { useReaderStore } from '@/stores/reader'
 import { useBorrowStore } from '@/stores/borrow'
 import { useCategoryStore } from '@/stores/category'
+import { getBorrowStatus } from '@/utils/library'
 
 const bookStore = useBookStore()
 const readerStore = useReaderStore()

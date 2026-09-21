@@ -98,9 +98,9 @@
           </template>
           <template v-else-if="column.key === 'status'">
             <a-badge
-              :status="record.status === 'active' ? 'success' : 'error'"
-              :text="record.status === 'active' ? '正常' : '已过期'"
-              :class="['status-badge', record.status]"
+              :status="getReaderStatus(record.expireDate) === 'active' ? 'success' : 'error'"
+              :text="getReaderStatus(record.expireDate) === 'active' ? '正常' : '已过期'"
+              :class="['status-badge', getReaderStatus(record.expireDate)]"
             />
           </template>
           <template v-else-if="column.key === 'borrow'">
@@ -214,8 +214,8 @@
         </a-descriptions-item>
         <a-descriptions-item label="状态">
           <a-badge
-            :status="currentReader.status === 'active' ? 'success' : 'error'"
-            :text="currentReader.status === 'active' ? '正常' : '已过期'"
+            :status="getReaderStatus(currentReader.expireDate) === 'active' ? 'success' : 'error'"
+            :text="getReaderStatus(currentReader.expireDate) === 'active' ? '正常' : '已过期'"
           />
         </a-descriptions-item>
       </a-descriptions>
@@ -228,8 +228,11 @@ import { ref, reactive, computed, nextTick } from 'vue'
 import { message } from 'ant-design-vue'
 import { PlusOutlined, EditOutlined, DeleteOutlined, EyeOutlined, SearchOutlined } from '@ant-design/icons-vue'
 import { useReaderStore } from '@/stores/reader'
+import { useBorrowStore } from '@/stores/borrow'
+import { getReaderStatus, formatDate } from '@/utils/library'
 
 const readerStore = useReaderStore()
+const borrowStore = useBorrowStore()
 
 const loading = ref(false)
 const searchKeyword = ref('')
@@ -240,7 +243,7 @@ const submitLoading = ref(false)
 const isEdit = ref(false)
 const editingId = ref(null)
 const formRef = ref(null)
-const currentReader = ref(null)
+const currentReaderId = ref(null)
 const isSearching = ref(false)
 const tableAnimating = ref(false)
 let searchTimeout = null
@@ -317,11 +320,16 @@ const filteredReaders = computed(() => {
   }
 
   if (selectedStatus.value) {
-    result = result.filter(reader => reader.status === selectedStatus.value)
+    result = result.filter(reader => getReaderStatus(reader.expireDate) === selectedStatus.value)
   }
 
   return result
 })
+
+// 详情弹窗始终读取 store 中的最新读者数据，编辑保存后同步刷新
+const currentReader = computed(() =>
+  currentReaderId.value ? readerStore.getReaderById(currentReaderId.value) : null
+)
 
 function handleSearch() {
   triggerSearchAnimation()
@@ -414,36 +422,63 @@ function showEditModal(record) {
 }
 
 function showDetailModal(record) {
-  currentReader.value = record
+  currentReaderId.value = record.id
   detailVisible.value = true
 }
 
 async function handleSubmit() {
+  // 防止重复提交：保存进行中再次点击直接忽略
+  if (submitLoading.value) return
   try {
     await formRef.value.validate()
     submitLoading.value = true
 
     await new Promise(resolve => setTimeout(resolve, 500))
 
+    // 仅提交可编辑档案字段，借阅数、注册日期、卡号、id 等
+    // 由 store 维护，编辑资料不会将其覆盖或重置
     const readerData = {
-      ...formState,
-      status: new Date(formState.expireDate) > new Date() ? 'active' : 'expired',
-      borrowCount: 0,
-      maxBorrow: formState.type === '教师' ? 10 : 5,
-      registerDate: new Date().toISOString().split('T')[0]
+      name: formState.name,
+      gender: formState.gender,
+      phone: formState.phone,
+      email: formState.email,
+      type: formState.type,
+      department: formState.department,
+      expireDate: formState.expireDate
     }
 
     if (isEdit.value) {
-      readerStore.updateReader(editingId.value, readerData)
+      const before = readerStore.getReaderById(editingId.value)
+      const nextMaxBorrow = formState.type === '教师' ? 10 : 5
+      readerStore.updateReader(editingId.value, {
+        ...readerData,
+        maxBorrow: nextMaxBorrow
+      })
+      // 姓名 / 卡号变化时同步关联借阅记录，保证档案与借阅详情一致
+      if (before && before.name !== readerData.name) {
+        borrowStore.syncReaderInfo(editingId.value, {
+          readerName: readerData.name,
+          cardNo: before.cardNo
+        })
+      }
       message.success('读者信息更新成功')
     } else {
-      readerStore.addReader(readerData)
+      readerStore.addReader({
+        ...readerData,
+        borrowCount: 0,
+        maxBorrow: formState.type === '教师' ? 10 : 5,
+        registerDate: formatDate(new Date())
+      })
       message.success('读者添加成功')
     }
 
     modalVisible.value = false
   } catch (error) {
-    console.error('表单验证失败:', error)
+    if (error?.code === 'DUPLICATE_CARD_NO') {
+      message.error(error.message)
+    } else {
+      console.error('表单验证失败:', error)
+    }
   } finally {
     submitLoading.value = false
   }
