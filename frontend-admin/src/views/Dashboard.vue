@@ -206,6 +206,11 @@ const recentBorrows = computed(() => {
   return [...borrowStore.records]
     .sort((a, b) => new Date(b.borrowDate) - new Date(a.borrowDate))
     .slice(0, 5)
+    .map(record => ({
+      ...record,
+      // 以 readerId 关联档案最新姓名，档案缺失时回退记录快照
+      readerName: readerStore.getReaderById(record.readerId)?.name || record.readerName
+    }))
 })
 
 const topCategories = computed(() => {

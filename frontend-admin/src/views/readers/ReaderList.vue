@@ -98,20 +98,20 @@
           </template>
           <template v-else-if="column.key === 'status'">
             <a-badge
-              :status="record.status === 'active' ? 'success' : 'error'"
-              :text="record.status === 'active' ? '正常' : '已过期'"
-              :class="['status-badge', record.status]"
+              :status="getReaderStatus(record) === 'active' ? 'success' : 'error'"
+              :text="getReaderStatus(record) === 'active' ? '正常' : '已过期'"
+              :class="['status-badge', getReaderStatus(record)]"
             />
           </template>
           <template v-else-if="column.key === 'borrow'">
             <div class="borrow-cell">
-              <span class="borrow-value">{{ record.borrowCount }} / {{ record.maxBorrow }}</span>
+              <span class="borrow-value">{{ getActiveBorrowCount(borrowStore.records, record.id) }} / {{ record.maxBorrow }}</span>
               <div class="borrow-bar">
-                <div 
-                  class="borrow-bar-fill" 
-                  :style="{ 
-                    width: `${(record.borrowCount / record.maxBorrow) * 100}%`,
-                    backgroundColor: record.borrowCount >= record.maxBorrow ? '#ff4d4f' : '#1890ff'
+                <div
+                  class="borrow-bar-fill"
+                  :style="{
+                    width: `${(getActiveBorrowCount(borrowStore.records, record.id) / record.maxBorrow) * 100}%`,
+                    backgroundColor: getActiveBorrowCount(borrowStore.records, record.id) >= record.maxBorrow ? '#ff4d4f' : '#1890ff'
                   }"
                 ></div>
               </div>
@@ -157,6 +157,9 @@
         :label-col="{ span: 5 }"
         :wrapper-col="{ span: 18 }"
       >
+        <a-form-item v-if="isEdit" label="卡号">
+          <a-input :value="editingCardNo" disabled />
+        </a-form-item>
         <a-form-item label="姓名" name="name">
           <a-input v-model:value="formState.name" placeholder="请输入姓名" />
         </a-form-item>
@@ -210,12 +213,12 @@
         <a-descriptions-item label="注册日期">{{ currentReader.registerDate }}</a-descriptions-item>
         <a-descriptions-item label="有效期至">{{ currentReader.expireDate }}</a-descriptions-item>
         <a-descriptions-item label="借阅情况">
-          {{ currentReader.borrowCount }} / {{ currentReader.maxBorrow }}
+          {{ getActiveBorrowCount(borrowStore.records, currentReader.id) }} / {{ currentReader.maxBorrow }}
         </a-descriptions-item>
         <a-descriptions-item label="状态">
           <a-badge
-            :status="currentReader.status === 'active' ? 'success' : 'error'"
-            :text="currentReader.status === 'active' ? '正常' : '已过期'"
+            :status="getReaderStatus(currentReader) === 'active' ? 'success' : 'error'"
+            :text="getReaderStatus(currentReader) === 'active' ? '正常' : '已过期'"
           />
         </a-descriptions-item>
       </a-descriptions>
@@ -228,8 +231,11 @@ import { ref, reactive, computed, nextTick } from 'vue'
 import { message } from 'ant-design-vue'
 import { PlusOutlined, EditOutlined, DeleteOutlined, EyeOutlined, SearchOutlined } from '@ant-design/icons-vue'
 import { useReaderStore } from '@/stores/reader'
+import { useBorrowStore } from '@/stores/borrow'
+import { getReaderStatus, getActiveBorrowCount } from '@/utils/readerRules'
 
 const readerStore = useReaderStore()
+const borrowStore = useBorrowStore()
 
 const loading = ref(false)
 const searchKeyword = ref('')
@@ -240,7 +246,12 @@ const submitLoading = ref(false)
 const isEdit = ref(false)
 const editingId = ref(null)
 const formRef = ref(null)
-const currentReader = ref(null)
+const detailId = ref(null)
+// 详情数据始终按 id 从 store 取最新值，编辑/刷新/返回后不会残留旧引用
+const currentReader = computed(() => readerStore.getReaderById(detailId.value))
+const editingCardNo = computed(() =>
+  isEdit.value ? readerStore.getReaderById(editingId.value)?.cardNo : ''
+)
 const isSearching = ref(false)
 const tableAnimating = ref(false)
 let searchTimeout = null
@@ -317,7 +328,7 @@ const filteredReaders = computed(() => {
   }
 
   if (selectedStatus.value) {
-    result = result.filter(reader => reader.status === selectedStatus.value)
+    result = result.filter(reader => getReaderStatus(reader) === selectedStatus.value)
   }
 
   return result
@@ -414,27 +425,37 @@ function showEditModal(record) {
 }
 
 function showDetailModal(record) {
-  currentReader.value = record
+  detailId.value = record.id
   detailVisible.value = true
 }
 
 async function handleSubmit() {
+  // 防重复提交：双击或连按时第二次直接忽略，不产生重复档案
+  if (submitLoading.value) return
   try {
     await formRef.value.validate()
     submitLoading.value = true
 
     await new Promise(resolve => setTimeout(resolve, 500))
 
+    // 仅提交可编辑字段；卡号由系统分配、注册日期与借阅情况在编辑时保留，
+    // 状态由有效期统一判定（边界日期到期当天仍为正常）
     const readerData = {
-      ...formState,
-      status: new Date(formState.expireDate) > new Date() ? 'active' : 'expired',
-      borrowCount: 0,
-      maxBorrow: formState.type === '教师' ? 10 : 5,
-      registerDate: new Date().toISOString().split('T')[0]
+      name: formState.name,
+      gender: formState.gender,
+      phone: formState.phone,
+      email: formState.email,
+      type: formState.type,
+      department: formState.department,
+      expireDate: formState.expireDate
     }
 
     if (isEdit.value) {
-      readerStore.updateReader(editingId.value, readerData)
+      const ok = readerStore.updateReader(editingId.value, readerData)
+      if (!ok) {
+        message.error('保存失败，卡号与已有读者重复')
+        return
+      }
       message.success('读者信息更新成功')
     } else {
       readerStore.addReader(readerData)

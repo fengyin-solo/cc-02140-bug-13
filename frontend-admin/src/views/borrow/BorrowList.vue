@@ -196,8 +196,8 @@
         <template #bodyCell="{ column, record, index }">
           <template v-if="column.key === 'reader'">
             <div class="reader-cell" :style="{ animationDelay: `${index * 0.05}s` }">
-              <div class="text-primary">{{ record.readerName }}</div>
-              <div class="text-secondary">{{ record.cardNo }}</div>
+              <div class="text-primary">{{ getReaderName(record) }}</div>
+              <div class="text-secondary">{{ getReaderCardNo(record) }}</div>
             </div>
           </template>
           <template v-else-if="column.key === 'book'">
@@ -317,6 +317,7 @@ import {
 import { useBorrowStore } from '@/stores/borrow'
 import { useReaderStore } from '@/stores/reader'
 import { useBookStore } from '@/stores/book'
+import { getReaderStatus, getActiveBorrowCount } from '@/utils/readerRules'
 
 const borrowStore = useBorrowStore()
 const readerStore = useReaderStore()
@@ -364,9 +365,9 @@ const filteredRecords = computed(() => {
   if (searchKeyword.value) {
     const keyword = searchKeyword.value.toLowerCase()
     result = result.filter(record =>
-      record.readerName.toLowerCase().includes(keyword) ||
+      getReaderName(record).toLowerCase().includes(keyword) ||
       record.bookTitle.toLowerCase().includes(keyword) ||
-      record.cardNo.toLowerCase().includes(keyword)
+      getReaderCardNo(record).toLowerCase().includes(keyword)
     )
   }
 
@@ -414,11 +415,24 @@ const returnedPercent = computed(() => {
   return Math.round((returnedCount.value / total) * 100)
 })
 
+// 可借读者：有效期统一按 getReaderStatus 判定（到期当天仍可借），
+// 借阅数按借阅记录实时派生，编辑资料 / 归还后各页面结果一致
 const availableReaders = computed(() => {
   return readerStore.readers.filter(r =>
-    r.status === 'active' && r.borrowCount < r.maxBorrow
+    getReaderStatus(r) === 'active' &&
+    getActiveBorrowCount(borrowStore.records, r.id) < r.maxBorrow
   )
 })
+
+// 借阅详情优先按 readerId 关联读者档案（编辑后姓名/卡号同步显示），
+// 档案缺失（历史数据）时回退到记录快照
+function getReaderName(record) {
+  return readerStore.getReaderById(record.readerId)?.name || record.readerName
+}
+
+function getReaderCardNo(record) {
+  return readerStore.getReaderById(record.readerId)?.cardNo || record.cardNo
+}
 
 const availableBooks = computed(() => {
   return bookStore.books.filter(b => b.available > 0)
@@ -511,10 +525,13 @@ function showBorrowModal() {
 }
 
 async function handleBorrowSubmit() {
+  // 防重复提交：连续点击不会产生第二条借阅记录
+  if (submitLoading.value) return
   try {
     await borrowFormRef.value.validate()
     submitLoading.value = true
 
+    // 提交瞬间重新取最新数据，避免基于旧值判断（下拉打开后档案可能被编辑过）
     const reader = readerStore.getReaderById(borrowForm.readerId)
     const book = bookStore.getBookById(borrowForm.bookId)
 
@@ -523,9 +540,41 @@ async function handleBorrowSubmit() {
       return
     }
 
+    // 借阅入口与新增/编辑共用同一有效期判定：到期当天仍有效，过期则拒绝
+    if (getReaderStatus(reader) !== 'active') {
+      message.error('该读者卡已过有效期，无法借阅')
+      return
+    }
+
+    // 卡号唯一规则：卡号对应的档案不唯一时拒绝，避免借阅挂错人
+    const sameCard = readerStore.readers.filter(
+      r => r.cardNo === reader.cardNo
+    )
+    if (sameCard.length !== 1) {
+      message.error('该读者卡号存在重复档案，请先处理后再借阅')
+      return
+    }
+
+    const currentBorrowed = getActiveBorrowCount(borrowStore.records, reader.id)
+    if (currentBorrowed >= reader.maxBorrow) {
+      message.error('该读者已达到最大借阅数量')
+      return
+    }
+
+    if (book.available <= 0) {
+      message.error('该图书库存不足')
+      return
+    }
+
+    // 同一读者同一本书未归还时不允许重复借阅（边界：重复提交不会产生两条）
+    if (borrowStore.hasActiveBorrow(reader.id, book.id)) {
+      message.error('该读者已借阅此书且尚未归还')
+      return
+    }
+
     await new Promise(resolve => setTimeout(resolve, 500))
 
-    borrowStore.addRecord({
+    const result = borrowStore.addRecord({
       readerId: reader.id,
       readerName: reader.name,
       cardNo: reader.cardNo,
@@ -534,8 +583,13 @@ async function handleBorrowSubmit() {
       isbn: book.isbn
     })
 
+    if (!result.success) {
+      message.error('该读者已借阅此书且尚未归还')
+      return
+    }
+
     bookStore.updateBook(book.id, { available: book.available - 1 })
-    readerStore.updateReader(reader.id, { borrowCount: reader.borrowCount + 1 })
+    readerStore.refreshBorrowCounts()
 
     message.success('借阅成功')
     borrowModalVisible.value = false
@@ -547,17 +601,16 @@ async function handleBorrowSubmit() {
 }
 
 function handleReturn(record) {
-  borrowStore.returnBook(record.id)
+  const ok = borrowStore.returnBook(record.id)
+  if (!ok) return
 
   const book = bookStore.getBookById(record.bookId)
-  const reader = readerStore.getReaderById(record.readerId)
 
   if (book) {
     bookStore.updateBook(book.id, { available: book.available + 1 })
   }
-  if (reader) {
-    readerStore.updateReader(reader.id, { borrowCount: Math.max(0, reader.borrowCount - 1) })
-  }
+  // 借阅情况以借阅记录为准重算，历史档案中对不上的计数也会被纠正
+  readerStore.refreshBorrowCounts()
 
   message.success('归还成功')
 }
